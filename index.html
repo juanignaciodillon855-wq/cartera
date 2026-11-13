@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gestión de cartera</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.4/babel.min.js"></script>
+</head>
+<body class="bg-[#F8F9FA]">
+  <div id="root"></div>
+
+  <script type="text/babel">
+const { useState, useEffect, useMemo, useRef } = React;
+const { flushSync } = ReactDOM;
+const { DoughnutController, ArcElement, Tooltip, Legend } = Chart;
+
+Chart.register(DoughnutController, ArcElement, Tooltip, Legend);
+
+/* ───────── Constantes y utilidades ───────── */
+
+const STORAGE_KEY = "portfolio-manager:v1";
+const FONT = 'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+const PALETTE = [
+  "#3B5B92", "#6C8EBF", "#8FB8A8", "#C9B27C",
+  "#B58A8A", "#8A7FB0", "#5E9CA0", "#A3AFC4",
+  "#D2A679", "#7B8794",
+];
+
+const DEFAULT_ASSETS = [
+  { id: 1, nombre: "AL30 (Bono soberano)", monto: 25000, tir: 14.8, cy: 8.2, md: 3.9, beta: 1.1 },
+  { id: 2, nombre: "GD35 (Bono soberano)", monto: 18000, tir: 13.9, cy: 7.1, md: 5.6, beta: 1.25 },
+  { id: 3, nombre: "YPF 2031 (ON corporativa)", monto: 15000, tir: 9.6, cy: 8.9, md: 3.7, beta: 0.85 },
+  { id: 4, nombre: "UST 10Y (Treasury)", monto: 22000, tir: 4.3, cy: 4.0, md: 8.1, beta: 0.2 },
+  { id: 5, nombre: "Letra CER (corto plazo)", monto: 10000, tir: 6.2, cy: 5.8, md: 0.6, beta: 0.4 },
+];
+
+const PRINT_CHART_SIZE = 224;
+
+/* Reglas de impresión (A4, fondo blanco). Las que compiten con breakpoints
+   responsive van acá con !important para no depender del orden de Tailwind. */
+const PRINT_CSS = `
+@page { size: A4 portrait; margin: 14mm 12mm; }
+@media print {
+  html, body { background: #fff !important; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .pm-container { max-width: none !important; padding: 0 !important; }
+  .pm-kpis { grid-template-columns: repeat(5, minmax(0, 1fr)) !important; gap: 8px !important; }
+  .pm-split { grid-template-columns: repeat(5, minmax(0, 1fr)) !important; gap: 12px !important; }
+  .pm-split > :first-child { grid-column: span 2 / span 2 !important; }
+  .pm-split > :last-child { grid-column: span 3 / span 3 !important; }
+  .pm-kpis > *, .pm-split > * { break-inside: avoid; page-break-inside: avoid; }
+  .pm-legend { grid-template-columns: minmax(0, 1fr) !important; margin-top: 12px !important; }
+  .pm-table { min-width: 0 !important; font-size: 11px; }
+  .pm-table th, .pm-table td { padding: 6px 6px !important; }
+  .pm-table tr { break-inside: avoid; page-break-inside: avoid; }
+  .pm-table thead { display: table-header-group; }
+  canvas { width: 100% !important; height: 100% !important; object-fit: contain; }
+}
+`;
+
+const usd = (n) =>
+  new Intl.NumberFormat("es-AR", { style: "currency", currency: "USD", minimumFractionDigits: 2 })
+    .format(Number.isFinite(n) ? n : 0);
+const num = (n, d = 2) =>
+  new Intl.NumberFormat("es-AR", { minimumFractionDigits: d, maximumFractionDigits: d })
+    .format(Number.isFinite(n) ? n : 0);
+
+const toNum = (v) => {
+  const n = parseFloat(String(v).replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+};
+
+function loadAssets() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch (e) {
+    /* almacenamiento no disponible */
+  }
+  return DEFAULT_ASSETS;
+}
+
+/* ───────── Gráfico de torta ───────── */
+
+function DoughnutChart({ assets, total }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  const totalRef = useRef(total);
+  totalRef.current = total;
+
+  useEffect(() => {
+    chartRef.current = new Chart(canvasRef.current, {
+      type: "doughnut",
+      data: {
+        labels: [],
+        datasets: [{ data: [], backgroundColor: [], borderColor: "#fff", borderWidth: 3, hoverOffset: 6 }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: "66%",
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: "#FFFFFF",
+            titleColor: "#0F172A",
+            bodyColor: "#475569",
+            borderColor: "#E2E8F0",
+            borderWidth: 1,
+            padding: 12,
+            cornerRadius: 10,
+            displayColors: true,
+            boxPadding: 4,
+            titleFont: { family: FONT, size: 13, weight: "600" },
+            bodyFont: { family: FONT, size: 12.5 },
+            callbacks: {
+              title: (items) => items[0].label,
+              label: (ctx) => {
+                const monto = ctx.parsed;
+                const pct = totalRef.current > 0 ? (monto / totalRef.current) * 100 : 0;
+                return [` Participación: ${num(pct, 1)}%`, ` Monto: ${usd(monto)}`];
+              },
+            },
+          },
+        },
+      },
+    });
+    const prepararImpresion = () => chartRef.current?.resize(PRINT_CHART_SIZE, PRINT_CHART_SIZE);
+    const restaurar = () => chartRef.current?.resize();
+    window.addEventListener("beforeprint", prepararImpresion);
+    window.addEventListener("afterprint", restaurar);
+    return () => {
+      window.removeEventListener("beforeprint", prepararImpresion);
+      window.removeEventListener("afterprint", restaurar);
+      chartRef.current?.destroy();
+    };
+  }, []);
+
+  useEffect(() => {
+    const c = chartRef.current;
+    if (!c) return;
+    const valid = assets.filter((a) => a.monto > 0);
+    c.data.labels = valid.map((a) => a.nombre || "Sin nombre");
+    c.data.datasets[0].data = valid.map((a) => a.monto);
+    c.data.datasets[0].backgroundColor = valid.map((a) => PALETTE[assets.indexOf(a) % PALETTE.length]);
+    c.update();
+  }, [assets]);
+
+  return (
+    <div className="relative h-64 w-full print:mx-auto print:h-56 print:w-56">
+      <canvas ref={canvasRef} />
+      <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+        <span className="text-xs text-slate-500">Capital total</span>
+        <span className="text-lg font-semibold text-slate-900">{usd(total)}</span>
+      </div>
+    </div>
+  );
+}
+
+/* ───────── Componentes de UI ───────── */
+
+const Card = ({ className = "", children }) => (
+  <section className={`rounded-2xl border border-slate-200/80 bg-white shadow-sm print:shadow-none ${className}`}>
+    {children}
+  </section>
+);
+
+const Kpi = ({ label, value, hint }) => (
+  <Card className="p-5 print:p-3">
+    <p className="text-sm text-slate-500 print:text-xs">{label}</p>
+    <p className="mt-2 text-2xl font-semibold tracking-tight text-slate-900 print:mt-1 print:text-base">{value}</p>
+    <p className="mt-1 text-xs text-slate-400">{hint}</p>
+  </Card>
+);
+
+const NumInput = ({ value, onChange, width = "w-24", prefix }) => (
+  <div className="flex items-center justify-end gap-1">
+    {prefix && <span className="text-slate-400 print:text-slate-700">{prefix}</span>}
+    <input
+      type="number"
+      step="any"
+      value={value}
+      onChange={(e) => onChange(toNum(e.target.value))}
+      className={`${width} print:hidden rounded-md border border-transparent bg-transparent px-2 py-1.5 text-right text-slate-800 outline-none transition hover:bg-slate-50 focus:border-slate-300 focus:bg-white focus:ring-2 focus:ring-slate-200`}
+    />
+    <span className="hidden text-slate-800 print:inline">{num(value, 2)}</span>
+  </div>
+);
+
+/* ───────── App ───────── */
+
+function PortfolioManager() {
+  const [assets, setAssets] = useState(loadAssets);
+  const [shock, setShock] = useState(100); // puntos básicos
+  const [msg, setMsg] = useState("");
+  const fileRef = useRef(null);
+  const [fecha, setFecha] = useState(() => new Date());
+
+  // La fecha del reporte se refresca justo antes de imprimir (botón o Ctrl+P)
+  useEffect(() => {
+    const refrescar = () => flushSync(() => setFecha(new Date()));
+    window.addEventListener("beforeprint", refrescar);
+    return () => window.removeEventListener("beforeprint", refrescar);
+  }, []);
+  const fechaTexto = fecha.toLocaleDateString("es-AR", { day: "numeric", month: "long", year: "numeric" });
+
+  // Persistencia automática
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(assets));
+    } catch (e) {
+      /* ignorar */
+    }
+  }, [assets]);
+
+  useEffect(() => {
+    if (!msg) return;
+    const t = setTimeout(() => setMsg(""), 3000);
+    return () => clearTimeout(t);
+  }, [msg]);
+
+  const m = useMemo(() => {
+    const total = assets.reduce((s, a) => s + a.monto, 0);
+    const w = (key) =>
+      total > 0 ? assets.reduce((s, a) => s + a[key] * a.monto, 0) / total : 0;
+    return { total, tir: w("tir"), cy: w("cy"), md: w("md"), beta: w("beta") };
+  }, [assets]);
+
+  // Impacto estimado: ΔP/P ≈ −MD × Δy
+  const impactoPct = -m.md * (shock / 100);
+  const impactoUsd = m.total * (impactoPct / 100);
+
+  const update = (id, key, val) =>
+    setAssets((prev) => prev.map((a) => (a.id === id ? { ...a, [key]: val } : a)));
+  const remove = (id) => setAssets((prev) => prev.filter((a) => a.id !== id));
+  const add = () =>
+    setAssets((prev) => [
+      ...prev,
+      { id: Date.now(), nombre: "Nuevo activo", monto: 0, tir: 0, cy: 0, md: 0, beta: 1 },
+    ]);
+
+  const exportJson = () => {
+    const blob = new Blob([JSON.stringify({ version: 1, assets }, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "cartera.json";
+    a.click();
+    URL.revokeObjectURL(url);
+    setMsg("Cartera exportada");
+  };
+
+  const importJson = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        const list = Array.isArray(data) ? data : data.assets;
+        if (!Array.isArray(list)) throw new Error();
+        setAssets(
+          list.map((a, i) => ({
+            id: Date.now() + i,
+            nombre: String(a.nombre ?? "Sin nombre"),
+            monto: toNum(a.monto),
+            tir: toNum(a.tir),
+            cy: toNum(a.cy),
+            md: toNum(a.md),
+            beta: toNum(a.beta),
+          }))
+        );
+        setMsg("Cartera importada");
+      } catch {
+        setMsg("El archivo no tiene un formato válido");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const btn =
+    "rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-slate-300";
+
+  const negative = impactoPct < 0;
+
+  return (
+    <div className="min-h-screen bg-[#F8F9FA] text-slate-800 print:min-h-0 print:bg-white" style={{ fontFamily: FONT }}>
+      <style>{PRINT_CSS}</style>
+
+      {/* Encabezado formal: solo visible al imprimir */}
+      <div className="mb-4 hidden border-b-2 border-slate-800 pb-3 print:block">
+        <div className="flex items-end justify-between">
+          <h1 className="text-xl font-semibold text-slate-900">Reporte de Cartera de Inversión</h1>
+          <p className="text-sm text-slate-600">Fecha: {fechaTexto}</p>
+        </div>
+      </div>
+
+      <div className="pm-container mx-auto max-w-6xl space-y-6 px-4 py-8 sm:px-6">
+        {/* Encabezado */}
+        <header className="flex flex-wrap items-end justify-between gap-4 print:hidden">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+              Gestión de cartera
+            </h1>
+            <p className="mt-1 text-sm text-slate-500">
+              Posiciones, métricas ponderadas y sensibilidad a tasas.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {msg && <span className="mr-2 text-sm text-slate-500">{msg}</span>}
+            <button className={btn} onClick={() => fileRef.current?.click()}>
+              Importar JSON
+            </button>
+            <button className={btn} onClick={exportJson}>
+              Exportar JSON
+            </button>
+            <button className={btn} onClick={() => window.print()}>
+              Exportar PDF
+            </button>
+            <input ref={fileRef} type="file" accept="application/json,.json" className="hidden" onChange={importJson} />
+          </div>
+        </header>
+
+        {/* KPIs */}
+        <div className="pm-kpis grid grid-cols-2 gap-4 lg:grid-cols-5">
+          <Kpi label="Capital total" value={usd(m.total)} hint={`${assets.length} posiciones`} />
+          <Kpi label="TIR ponderada" value={`${num(m.tir)}%`} hint="Ponderada por monto" />
+          <Kpi label="Current yield" value={`${num(m.cy)}%`} hint="Renta corriente" />
+          <Kpi label="Duración modificada" value={`${num(m.md)} años`} hint="Sensibilidad a tasas" />
+          <Kpi label="Beta" value={num(m.beta)} hint="Frente al mercado" />
+        </div>
+
+        {/* Gráfico + Stress test */}
+        <div className="pm-split grid gap-6 lg:grid-cols-5">
+          <Card className="p-6 lg:col-span-2 print:p-4">
+            <h2 className="text-base font-semibold text-slate-900 print:mb-3">Composición</h2>
+            <p className="mb-4 text-sm text-slate-500 print:hidden">Pasá el cursor sobre una porción para ver el monto.</p>
+            <DoughnutChart assets={assets} total={m.total} />
+            <ul className="pm-legend mt-5 grid grid-cols-1 gap-x-4 gap-y-2 text-sm sm:grid-cols-2">
+              {assets.map((a, i) => (
+                <li key={a.id} className="flex items-center gap-2 text-slate-600">
+                  <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: PALETTE[i % PALETTE.length] }} />
+                  <span className="truncate">{a.nombre || "Sin nombre"}</span>
+                  <span className="ml-auto text-slate-400">
+                    {num(m.total > 0 ? (a.monto / m.total) * 100 : 0, 1)}%
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </Card>
+
+          <Card className="p-6 lg:col-span-3 print:p-4">
+            <h2 className="text-base font-semibold text-slate-900">Test de sensibilidad</h2>
+            <p className="mb-6 text-sm text-slate-500">
+              Aplicá un cambio paralelo en las tasas y mirá el impacto estimado: −Duración modificada × Δ tasa.
+            </p>
+
+            <div className="flex items-baseline justify-between">
+              <span className="text-sm text-slate-500">Shock de tasas</span>
+              <span className="text-lg font-semibold text-slate-900">
+                {shock > 0 ? "+" : ""}
+                {shock} pb
+              </span>
+            </div>
+            <input
+              type="range"
+              min={-300}
+              max={300}
+              step={25}
+              value={shock}
+              onChange={(e) => setShock(Number(e.target.value))}
+              className="mt-3 h-2 w-full cursor-pointer print:hidden appearance-none rounded-full bg-slate-200 accent-slate-700"
+              aria-label="Shock de tasas en puntos básicos"
+            />
+            <div className="mt-2 flex justify-between text-xs text-slate-400 print:hidden">
+              <span>−300 pb</span>
+              <span>0</span>
+              <span>+300 pb</span>
+            </div>
+
+            <div className="mt-8 grid gap-4 sm:grid-cols-2 print:mt-4">
+              <div className="rounded-xl bg-slate-50 p-4">
+                <p className="text-sm text-slate-500">Variación del precio</p>
+                <p className={`mt-1 text-2xl font-semibold print:text-lg ${negative ? "text-rose-700" : impactoPct > 0 ? "text-emerald-700" : "text-slate-900"}`}>
+                  {impactoPct > 0 ? "+" : ""}
+                  {num(impactoPct)}%
+                </p>
+              </div>
+              <div className="rounded-xl bg-slate-50 p-4">
+                <p className="text-sm text-slate-500">Impacto en USD</p>
+                <p className={`mt-1 text-2xl font-semibold print:text-lg ${negative ? "text-rose-700" : impactoUsd > 0 ? "text-emerald-700" : "text-slate-900"}`}>
+                  {impactoUsd > 0 ? "+" : ""}
+                  {usd(impactoUsd)}
+                </p>
+              </div>
+            </div>
+            <p className="mt-4 text-sm text-slate-500">
+              Capital estimado tras el shock:{" "}
+              <span className="font-medium text-slate-800">{usd(m.total + impactoUsd)}</span>. Es una aproximación
+              lineal: no incluye convexidad.
+            </p>
+          </Card>
+        </div>
+
+        {/* Tabla de posiciones */}
+        <Card>
+          <div className="flex items-center justify-between px-6 pt-6 print:px-4 print:pt-4">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900">Posiciones</h2>
+              <p className="text-sm text-slate-500 print:hidden">Editá cualquier valor directamente en la tabla.</p>
+            </div>
+            <button
+              onClick={add}
+              className="rounded-lg bg-slate-900 px-3.5 py-2 print:hidden text-sm font-medium text-white shadow-sm transition hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-offset-2"
+            >
+              Agregar activo
+            </button>
+          </div>
+
+          <div className="mt-4 overflow-x-auto print:overflow-visible">
+            <table className="pm-table w-full min-w-[820px] text-sm">
+              <thead>
+                <tr className="border-y border-slate-100 bg-slate-50/60 text-slate-500">
+                  <th className="px-6 py-3 text-left font-medium">Activo</th>
+                  <th className="px-3 py-3 text-right font-medium">Monto (USD)</th>
+                  <th className="px-3 py-3 text-right font-medium">Peso</th>
+                  <th className="px-3 py-3 text-right font-medium">TIR (%)</th>
+                  <th className="px-3 py-3 text-right font-medium">Current yield (%)</th>
+                  <th className="px-3 py-3 text-right font-medium">MD</th>
+                  <th className="px-3 py-3 text-right font-medium">Beta</th>
+                  <th className="px-6 py-3 print:hidden" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {assets.map((a, i) => (
+                  <tr key={a.id} className="transition hover:bg-slate-50/50">
+                    <td className="px-6 py-2">
+                      <div className="flex items-center gap-3">
+                        <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: PALETTE[i % PALETTE.length] }} />
+                        <span className="hidden text-slate-900 print:inline">{a.nombre || "Sin nombre"}</span>
+                        <input
+                          value={a.nombre}
+                          onChange={(e) => update(a.id, "nombre", e.target.value)}
+                          className="w-full min-w-[180px] print:hidden rounded-md border border-transparent bg-transparent px-2 py-1.5 text-slate-900 outline-none transition hover:bg-slate-50 focus:border-slate-300 focus:bg-white focus:ring-2 focus:ring-slate-200"
+                        />
+                      </div>
+                    </td>
+                    <td className="px-3 py-2"><NumInput value={a.monto} onChange={(v) => update(a.id, "monto", v)} width="w-28" prefix="$" /></td>
+                    <td className="px-3 py-2 text-right text-slate-500">
+                      {num(m.total > 0 ? (a.monto / m.total) * 100 : 0, 1)}%
+                    </td>
+                    <td className="px-3 py-2"><NumInput value={a.tir} onChange={(v) => update(a.id, "tir", v)} /></td>
+                    <td className="px-3 py-2"><NumInput value={a.cy} onChange={(v) => update(a.id, "cy", v)} /></td>
+                    <td className="px-3 py-2"><NumInput value={a.md} onChange={(v) => update(a.id, "md", v)} width="w-20" /></td>
+                    <td className="px-3 py-2"><NumInput value={a.beta} onChange={(v) => update(a.id, "beta", v)} width="w-20" /></td>
+                    <td className="px-6 py-2 text-right print:hidden">
+                      <button
+                        onClick={() => remove(a.id)}
+                        className="rounded-md px-2 py-1 text-slate-400 transition hover:bg-rose-50 hover:text-rose-700 focus:outline-none focus:ring-2 focus:ring-rose-200"
+                        aria-label={`Eliminar ${a.nombre}`}
+                      >
+                        Eliminar
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {assets.length === 0 && (
+                  <tr>
+                    <td colSpan={8} className="px-6 py-10 text-center text-slate-500">
+                      La cartera está vacía. Agregá un activo o importá un archivo JSON.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+
+        <p className="pb-4 text-center text-xs text-slate-400 print:hidden">
+          Los cambios se guardan automáticamente en este navegador.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<PortfolioManager />);
+  </script>
+</body>
+</html>
